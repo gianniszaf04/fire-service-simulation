@@ -1,0 +1,1407 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[;;; ============================================================
+;;;  FIRE SERVICE SIMULATION - NetLogo
+;;; ============================================================
+
+;; Two types of agents: scouters (detect fire) and units (extinguish fire)
+breed [scouters scouter]
+breed [units unit]
+
+;; Each patch (grid cell) stores information about the tree on it
+patches-own [
+  tree-type   ;; 0=bare ground, 1=pine (fast burn), 2=oak (medium burn), 3=birch (slow burn)
+  tree-state  ;; current state: "none" | "ok" | "burning" | "extinguished" | "burned"
+  burn-timer  ;; how many ticks this patch has been burning
+  burn-limit  ;; how many ticks until this tree is completely burned
+]
+
+;; Scouter agents patrol the area and report fires to ground units
+scouters-own [
+  target-x target-y  ;; current patrol waypoint to move toward
+  fire-x fire-y      ;; coordinates of detected fire
+  state              ;; "patrolling" = searching | "watching" = monitoring a fire
+]
+
+;; Ground units move to fires, extinguish them, and return to base for water
+units-own [
+  water                        ;; current water supply (max defined by slider)
+  state                        ;; "idle" | "responding" | "fighting" | "returning"
+  target-fire-x target-fire-y  ;; coordinates of the fire this unit is heading to
+  prev-fire-x prev-fire-y      ;; saved original target before a detour
+  has-prev-target              ;; flag: true if there is a saved target to return to
+]
+
+;; Shared global variables accessible by all agents
+globals [
+  base-x base-y                        ;; coordinates of the base (center of map)
+  total-burned total-extinguished active-fires  ;; statistics for plots/monitors
+  wind-dx wind-dy                      ;; wind direction vector (x and y components)
+  pine-burn-limit oak-burn-limit birch-burn-limit  ;; burn durations per tree type
+]
+
+;;; ============================================================
+;;;  SETUP - Initialize the simulation
+;;; ============================================================
+to setup
+  clear-all
+
+  ;; Place the base at the center of the map
+  set base-x 0
+  set base-y 0
+
+  ;; Reset all statistics to zero
+  set total-burned 0
+  set total-extinguished 0
+  set active-fires 0
+
+  ;; Define how long each tree type takes to fully burn (in ticks)
+  set pine-burn-limit  30  ;; pine burns fastest
+  set oak-burn-limit   60  ;; oak burns at medium speed
+  set birch-burn-limit 90  ;; birch burns slowest
+
+  ;; Convert wind angle and speed into a direction vector using trigonometry
+  set wind-dx wind-speed * sin wind-angle
+  set wind-dy wind-speed * cos wind-angle
+
+  setup-forest
+  setup-base
+  setup-scouters
+  setup-units
+  reset-ticks
+end
+
+;; Place trees randomly across the map based on forest-density and pine-ratio sliders
+to setup-forest
+  ask patches [
+    ;; Start every patch as bare ground
+    set tree-type 0
+    set tree-state "none"
+    set burn-timer 0
+    set burn-limit 0
+    set pcolor brown + 2
+
+    ;; Only plant trees within bounds and outside the base area
+    let within-bounds? (abs pxcor < max-pxcor and abs pycor < max-pycor)
+    let outside-base? not (abs pxcor < 3 and abs pycor < 3)
+
+    if within-bounds? and outside-base? and (random-float 1.0 < forest-density) [
+      set tree-state "ok"
+
+      ;; Randomly assign tree type: pine (based on pine-ratio), or oak/birch (50/50)
+      ifelse random-float 1.0 < pine-ratio [
+        set tree-type 1  set burn-limit pine-burn-limit  set pcolor green
+      ][
+        ifelse random-float 1.0 < 0.5 [
+          set tree-type 2  set burn-limit oak-burn-limit  set pcolor green - 1
+        ][
+          set tree-type 3  set burn-limit birch-burn-limit  set pcolor green - 2
+        ]
+      ]
+    ]
+  ]
+end
+
+;; Mark the central base area as gray (no trees, agents refill water here)
+to setup-base
+  ask patches with [abs pxcor <= 2 and abs pycor <= 2] [
+    set tree-type 0
+    set tree-state "none"
+    set pcolor gray
+  ]
+end
+
+;; Create scouter agents at random positions across the map
+to setup-scouters
+  create-scouters num-scouters [
+    set color white
+    set shape "airplane"
+    set size 1.5
+    set state "patrolling"
+    set-patrol-waypoint        ;; assign a first random waypoint
+    setxy random-xcor random-ycor
+  ]
+end
+
+;; Assign a new random patrol waypoint to a scouter
+to set-patrol-waypoint
+  set target-x (random (2 * max-pxcor)) - max-pxcor
+  set target-y (random (2 * max-pycor)) - max-pycor
+end
+
+;; Create ground units near the base
+to setup-units
+  create-units num-units [
+    set color blue
+    set shape "truck"
+    set size 2
+    set water max-water        ;; start with full water tank
+    set state "idle"
+    set has-prev-target false  ;; no saved detour target at start
+    set label water            ;; display water level on the agent
+    set label-color white
+    setxy (base-x + random 3 - 1) (base-y + random 3 - 1)
+  ]
+end
+
+;;; ============================================================
+;;;  GO - Main simulation loop (runs every tick)
+;;; ============================================================
+to go
+  spread-fire           ;; update fire spread across patches
+  update-tree-colors    ;; refresh patch colors to reflect current states
+
+  ask scouters [ scouter-step ]  ;; each scouter takes one step
+  ask units [
+    unit-step
+    set label water    ;; keep water display updated
+  ]
+
+  ;; Update global statistics used by monitors and plots
+  set total-burned       count patches with [tree-state = "burned"]
+  set total-extinguished count patches with [tree-state = "extinguished"]
+  set active-fires       count patches with [tree-state = "burning"]
+
+  tick
+end
+
+;;; ============================================================
+;;;  FIRE - Ignition, Spread, and Color Updates
+;;; ============================================================
+
+;; Called by the IGNITE button: click on a tree patch to start a fire
+to ignite-at-mouse
+  if mouse-down? [
+    ask patch mouse-xcor mouse-ycor [
+      if tree-type > 0 and tree-state = "ok" [
+        set tree-state "burning"
+        set burn-timer 0
+      ]
+    ]
+  ]
+end
+
+;; Spread fire to neighboring patches each tick, affected by wind
+to spread-fire
+  ask patches with [tree-state = "burning"] [
+    set burn-timer burn-timer + 1
+
+    ;; If the tree has burned long enough, it is completely destroyed
+    if burn-timer >= burn-limit [ set tree-state "burned" ]
+
+    ;; Only attempt to spread every spread-interval ticks (controls fire speed)
+    if burn-timer mod spread-interval = 0 [
+
+      ;; Check the 4 directly adjacent neighbors (up/down/left/right)
+      ask neighbors4 [
+        if tree-type > 0 and tree-state = "ok" [
+          let prob base-spread-prob
+
+          ;; Calculate how aligned this neighbor is with the wind direction
+          ;; If the neighbor is downwind, fire spreads faster; upwind = slower
+          let delta-x (pxcor - [pxcor] of myself)
+          let delta-y (pycor - [pycor] of myself)
+          let dot (delta-x * wind-dx + delta-y * wind-dy)
+          if dot > 0 [ set prob prob * wind-factor ]  ;; downwind: higher chance
+          if dot < 0 [ set prob prob / wind-factor ]  ;; upwind: lower chance
+
+          ;; Pine trees catch fire 30% more easily than other types
+          if tree-type = 1 [ set prob prob * 1.3 ]
+
+          if random-float 1.0 < prob [
+            set tree-state "burning"
+            set burn-timer 0
+          ]
+        ]
+      ]
+
+      ;; Pine trees can spread fire over longer distances via flying pinecones
+      if tree-type = 1 and enable-pinecones and (random-float 1.0 < 0.05) [
+        let jump-dist 2 + random 3  ;; random long-range jump distance
+        let tp patch (pxcor + random (jump-dist * 2) - jump-dist)
+                     (pycor + random (jump-dist * 2) - jump-dist)
+        if tp != nobody [
+          ask tp [
+            if tree-type > 0 and tree-state = "ok" and (random-float 1.0 < 0.3) [
+              set tree-state "burning"
+              set burn-timer 0
+            ]
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+;; Update the color of each patch to visually reflect its current state
+to update-tree-colors
+  ask patches [
+    ;; Healthy trees: different shades of green per type
+    if tree-state = "ok" [
+      if tree-type = 1 [ set pcolor green ]        ;; pine: bright green
+      if tree-type = 2 [ set pcolor green - 1 ]    ;; oak: medium green
+      if tree-type = 3 [ set pcolor green - 2 ]    ;; birch: dark green
+    ]
+    ;; Burning trees: red in early stages, dark red (color 15) after N/2 ticks
+    if tree-state = "burning" [
+      set pcolor ifelse-value (burn-timer < burn-limit / 2) [red] [15]
+    ]
+    if tree-state = "extinguished" [ set pcolor yellow ]  ;; successfully put out
+    if tree-state = "burned"       [ set pcolor black ]   ;; completely destroyed
+    if tree-state = "none" [
+      ;; Base area is gray, bare ground is brown
+      set pcolor ifelse-value (abs pxcor <= 2 and abs pycor <= 2) [gray] [brown + 2]
+    ]
+  ]
+end
+
+;;; ============================================================
+;;;  SCOUTER - Patrol and fire detection logic
+;;; ============================================================
+to scouter-step
+  ;; Scouter dies if it gets caught in a burning patch
+  if [tree-state] of patch-here = "burning" [ die ]
+
+  ;; If watching a fire that is no longer burning, resume patrolling
+  if state = "watching" [
+    let fp patch fire-x fire-y
+    if fp = nobody or [tree-state] of fp != "burning" [
+      set state "patrolling"
+      set-patrol-waypoint
+    ]
+  ]
+
+  if state = "patrolling" [
+    ;; Scan for any burning patches within the perception radius
+    let nearby patches in-radius perception-radius with [tree-state = "burning"]
+    if any? nearby [
+      ;; Lock onto the closest fire detected
+      let f min-one-of nearby [distance myself]
+      set fire-x [pxcor] of f
+      set fire-y [pycor] of f
+      set state "watching"
+      ;; Broadcast the fire location to ALL ground units
+      ask units [ receive-fire-signal [fire-x] of myself [fire-y] of myself ]
+    ]
+    ;; Move toward current waypoint; pick a new one upon arrival
+    facexy target-x target-y
+    if distancexy target-x target-y < 1 [ set-patrol-waypoint ]
+    fd scouter-speed
+  ]
+
+  if state = "watching" [
+    ;; Hover near the fire but maintain a safe distance (between 2 and 3 patches)
+    facexy fire-x fire-y
+    if distancexy fire-x fire-y > 3 [ fd scouter-speed ]        ;; move closer if too far
+    if distancexy fire-x fire-y < 2 [ rt 180 fd scouter-speed ] ;; back away if too close
+  ]
+end
+
+;;; ============================================================
+;;;  UNIT - Movement, detour, and firefighting logic
+;;; ============================================================
+
+;; Called when a scouter broadcasts a fire signal
+;; Only idle units respond — units already on a task keep their current target
+to receive-fire-signal [fx fy]
+  if state = "idle" [
+    set target-fire-x fx
+    set target-fire-y fy
+    set state "responding"
+  ]
+end
+
+to unit-step
+  ;; Unit is destroyed if its current patch catches fire
+  if [tree-state] of patch-here = "burning" [ die ]
+
+  ;; Ground units are bulky and must avoid trees — turn right if on a tree patch
+  if tree-type != 0 and tree-state = "ok" [
+    rt 90
+  ]
+
+  ;; IDLE: wander near base; independently detect nearby fires
+  if state = "idle" [
+    let nearby patches in-radius (perception-radius / 2) with [tree-state = "burning"]
+    if any? nearby [ target-fire min-one-of nearby [distance myself] ]
+    rt random 30 - 15   ;; random wandering direction
+    fd scouter-speed / 2
+  ]
+
+  ;; RETURNING: head back to base to refill water tank
+  if state = "returning" [
+    facexy base-x base-y
+    if distancexy base-x base-y < 2 [
+      set water max-water        ;; refill to maximum capacity
+      set has-prev-target false  ;; clear any saved detour target
+      set state "idle"
+    ]
+    fd scouter-speed / 2
+  ]
+
+  ;; RESPONDING: moving toward a target fire
+  if state = "responding" [
+    let fp patch target-fire-x target-fire-y
+
+    ;; If the target fire is gone, check if there was an original target to return to
+    if fp = nobody or [tree-state] of fp != "burning" [
+      ifelse has-prev-target [
+        ;; Return to the original target after completing the detour
+        set target-fire-x prev-fire-x
+        set target-fire-y prev-fire-y
+        set has-prev-target false
+      ][
+        find-new-fire       ;; no saved target, search for any active fire
+        if state = "idle" [ stop ]
+      ]
+    ]
+
+    if water <= 0 [ set state "returning"  stop ]  ;; out of water, go refill
+
+    ;; If a fire is encountered along the route, fight it before continuing
+    let en-route patches in-radius 2 with [tree-state = "burning"]
+    if any? en-route [
+      let detour-fire min-one-of en-route [distance myself]
+      ;; Save the current target only once before starting the detour
+      if not has-prev-target [
+        set prev-fire-x target-fire-x
+        set prev-fire-y target-fire-y
+        set has-prev-target true
+      ]
+      fight-fire detour-fire
+      stop
+    ]
+
+    facexy target-fire-x target-fire-y
+    if any? other units in-radius 1.5 [ rt 45 ]  ;; avoid colliding with other units
+    fd scouter-speed / 2
+
+    ;; Close enough to the fire — switch to fighting mode
+    if distancexy target-fire-x target-fire-y < 1.5 [ set state "fighting" ]
+  ]
+
+  ;; FIGHTING: actively extinguishing the target fire
+  if state = "fighting" [
+    let fp patch target-fire-x target-fire-y
+
+    ;; Fire is gone — return to original target or find a new one
+    if fp = nobody or [tree-state] of fp != "burning" [
+      ifelse has-prev-target [
+        set target-fire-x prev-fire-x
+        set target-fire-y prev-fire-y
+        set has-prev-target false
+        set state "responding"
+      ][
+        find-new-fire
+      ]
+      stop
+    ]
+
+    if water <= 0 [ set state "returning"  stop ]
+    fight-fire fp
+  ]
+end
+
+;; Search for the nearest active fire; go idle if none exist
+to find-new-fire
+  let fires patches with [tree-state = "burning"]
+  ifelse any? fires [
+    target-fire min-one-of fires [distance myself]
+  ][
+    set state "idle"
+  ]
+end
+
+;; Set a fire patch as the new target and switch to responding state
+to target-fire [f]
+  set target-fire-x [pxcor] of f
+  set target-fire-y [pycor] of f
+  set state "responding"
+end
+
+;; Extinguish one burning patch and consume 1 unit of water
+to fight-fire [fire-patch]
+  ask fire-patch [
+    if tree-state = "burning" [ set tree-state "extinguished" ]
+  ]
+  set water water - 1
+  if water <= 0 [ set state "returning" ]  ;; go refill if tank is empty
+end
+
+;;; ============================================================
+;;;  REPORTERS - Used by plots and monitors in the interface
+;;; ============================================================
+
+;; Total number of patches that have any tree (used as denominator for percentages)
+to-report total-tree-patches
+  report count patches with [tree-type > 0]
+end
+
+;; Percentage of trees that have been completely burned
+to-report pct-burned
+  let tp total-tree-patches
+  report ifelse-value (tp = 0) [0] [(total-burned / tp) * 100]
+end
+
+;; Percentage of trees that were successfully extinguished by a unit
+to-report pct-extinguished
+  let tp total-tree-patches
+  report ifelse-value (tp = 0) [0] [(total-extinguished / tp) * 100]
+end
+
+;; Percentage of trees still healthy (not burned or burning)
+to-report pct-ok
+  let tp total-tree-patches
+  report ifelse-value (tp = 0) [0] [(count patches with [tree-state = "ok"] / tp) * 100]
+end]]></code>
+  <widgets>
+    <view x="605" wrappingAllowedX="true" y="70" frameRate="30.0" minPycor="-16" height="400" showTickCounter="true" patchSize="12.0" fontSize="10" wrappingAllowedY="true" width="400" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <slider x="10" step="1" y="75" max="20" width="180" display="num-scouters" height="50" min="1" direction="Horizontal" default="2.0" variable="num-scouters"></slider>
+    <slider x="380" step="1" y="75" max="15" width="180" display="perception-radius" height="50" min="2" direction="Horizontal" default="8.0" variable="perception-radius"></slider>
+    <slider x="195" step="0.5" y="75" max="5.0" width="180" display="scouter-speed" height="50" min="0.5" direction="Horizontal" default="2.0" variable="scouter-speed"></slider>
+    <slider x="10" step="1" y="155" max="30" width="180" display="num-units" height="50" min="1" direction="Horizontal" default="30.0" variable="num-units"></slider>
+    <note x="10" y="130" backgroundDark="0" fontSize="12" width="180" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Number of Units</note>
+    <note x="10" y="50" backgroundDark="0" fontSize="12" width="180" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Number of Drones</note>
+    <note x="195" y="50" backgroundDark="0" fontSize="12" width="180" markdown="false" height="25" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Speed of Drones</note>
+    <note x="380" y="50" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Detection Radius of Drones</note>
+    <note x="380" y="475" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Wind Influence Multiplier</note>
+    <note x="195" y="475" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Wind Direction</note>
+    <note x="10" y="475" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Wind Speed</note>
+    <slider x="10" step="0.1" y="500" max="1.0" width="180" display="wind-speed" height="50" min="0" direction="Horizontal" default="1.0" variable="wind-speed"></slider>
+    <slider x="195" step="15" y="500" max="360" width="180" display="wind-angle" height="50" min="0" direction="Horizontal" default="360.0" variable="wind-angle" units="°"></slider>
+    <slider x="380" step="0.5" y="500" max="5.0" width="180" display="wind-factor" height="50" min="1.0" direction="Horizontal" default="5.0" variable="wind-factor"></slider>
+    <note x="10" y="445" backgroundDark="-12895429" fontSize="12" width="550" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Weather Conditions</note>
+    <note x="10" y="20" backgroundDark="-15390905" fontSize="12" width="550" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Firefighting Forces</note>
+    <switch x="605" y="20" height="40" on="true" variable="enable-pinecones" width="130" display="enable-pinecones"></switch>
+    <button x="815" y="20" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="56" display="GO">go</button>
+    <button x="745" y="20" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55" display="SETUP">setup</button>
+    <button x="880" y="20" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="125" display="IGNITE">ignite-at-mouse</button>
+    <monitor x="865" precision="2" y="480" height="60" fontSize="11" width="105" display="Active Fires">active-fires</monitor>
+    <monitor x="635" precision="2" y="480" height="60" units="%" fontSize="12" width="105" display="Burned">pct-burned</monitor>
+    <monitor x="695" precision="2" y="550" height="60" fontSize="11" width="105" display="Scouters ">count scouters</monitor>
+    <monitor x="810" precision="2" y="550" height="60" fontSize="11" width="105" display="Units ">count units</monitor>
+    <monitor x="750" precision="2" y="480" height="60" units="%" fontSize="11" width="105" display="Extinguished">pct-extinguished</monitor>
+    <plot x="1095" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="% of Trees" y="130" xMin="0.0" height="245" legend="true" xMax="10.0" yMin="0.0" width="355" xAxis="Time" display="Forest Status">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Burned" color="-16777216" legend="false">
+        <setup></setup>
+        <update>plot pct-burned</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Extinguished" color="-1184463" legend="true">
+        <setup></setup>
+        <update>plot pct-extinguished</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Safe" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot pct-ok</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Burning" color="-2674135" legend="true">
+        <setup></setup>
+        <update><![CDATA[if total-tree-patches > 0 [ plot (active-fires / total-tree-patches) * 100 ]]]></update>
+      </pen>
+    </plot>
+    <note x="10" y="215" backgroundDark="-15575016" fontSize="12" width="365" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Forest Characteristics</note>
+    <note x="10" y="330" backgroundDark="-10873583" fontSize="12" width="365" markdown="false" height="20" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Fire Behavior</note>
+    <slider x="195" step="1" y="385" max="10" width="180" display="spread-interval" height="50" min="1" direction="Horizontal" default="2.0" variable="spread-interval"></slider>
+    <note x="195" y="360" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Fire Spread Interval</note>
+    <slider x="10" step="0.01" y="385" max="0.5" width="180" display="base-spread-prob" height="50" min="0.01" direction="Horizontal" default="0.25" variable="base-spread-prob"></slider>
+    <note x="10" y="360" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Base Spread Probability</note>
+    <note x="10" y="245" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Forest Density</note>
+    <note x="195" y="245" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Pine Tree Ratio</note>
+    <slider x="10" step="0.05" y="270" max="0.95" width="180" display="forest-density" height="50" min="0.1" direction="Horizontal" default="0.95" variable="forest-density" units="%"></slider>
+    <slider x="195" step="0.1" y="270" max="1.0" width="180" display="pine-ratio" height="50" min="0.0" direction="Horizontal" default="0.8" variable="pine-ratio" units="%"></slider>
+    <note x="195" y="130" backgroundDark="0" fontSize="12" width="180" markdown="false" height="26" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Water Capacity of Units</note>
+    <slider x="195" step="1" y="155" max="12" width="180" display="max-water" height="50" min="1" direction="Horizontal" default="6.0" variable="max-water"></slider>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+Αυτό το μοντέλο είναι μια προσομοίωση δασικής πυρκαγιάς (Fire Service Simulation) που εστιάζει στη συνεργασία μεταξύ διαφορετικών πυροσβεστικών δυνάμεων. Μοντελοποιεί την εξάπλωση της φωτιάς σε ένα δάσος με διαφορετικούς τύπους δέντρων, καθώς και τον συντονισμό εναέριων μέσων (scouters) που εντοπίζουν τη φωτιά και επίγειων οχημάτων (units) που αναλαμβάνουν την κατάσβεση.
+
+## HOW IT WORKS
+
+Tο μοντέλο βασίζεται σε αυτόνομους πράκτορες (agents) και κανόνες κυψελωτών αυτόματων:
+Το Δάσος: Αποτελείται από τρία είδη δέντρων: Πεύκα (καίγονται γρήγορα), Βελανιδιές (καίγονται κανονικά) και Σημύδες (καίγονται αργά). Η εξάπλωση της φωτιάς επηρεάζεται από τον τύπο του δέντρου και την κατεύθυνση/ένταση του ανέμου. Τα πεύκα μπορούν να εκσφενδονίσουν φλεγόμενα κουκουνάρια δημιουργώντας νέες εστίες.
+Αεροπλάνα (Scouters): Περιπολούν τυχαία στον χάρτη. Μόλις εντοπίσουν φωτιά (μέσω της ακτίνας αντίληψής τους), κλειδώνουν σε αυτή και εκπέμπουν σήμα με τις συντεταγμένες στα επίγεια οχήματα.
+Πυροσβεστικά Οχήματα (Units): Βρίσκονται αρχικά στη βάση. Όταν λάβουν σήμα, κατευθύνονται στο σημείο. Καταναλώνουν μονάδες νερού για κάθε δέντρο που σβήνουν. Αν στον δρόμο τους βρουν άλλη φωτιά, την σβήνουν (κάνοντας παράκαμψη) και μετά επιστρέφουν στον αρχικό τους στόχο. Όταν αδειάσει η δεξαμενή τους, επιστρέφουν στη γκρίζα κεντρική βάση για ανεφοδιασμό.
+
+## HOW TO USE IT
+
+Για να ξεκινήσετε την προσομοίωση, πατήστε το κουμπί SETUP για να δημιουργηθεί ο χάρτης και οι δυνάμεις, και έπειτα το GO για να τρέξει ο χρόνος.
+Μπορείτε να βάλετε φωτιά χειροκίνητα κάνοντας κλικ με το ποντίκι πάνω σε ένα δέντρο (αν υπάρχει κουμπί που καλεί την εντολή ignite-at-mouse).
+Βασικές παράμετροι διεπαφής (Sliders & Switches):
+forest-density: Καθορίζει την πυκνότητα του δάσους.
+pine-ratio: Ρυθμίζει το ποσοστό των πεύκων (πιο εύφλεκτα δέντρα) σε σχέση με τα υπόλοιπα.
+num-scouters & num-units: Ο αριθμός των εναέριων περιπολιών και των πυροσβεστικών οχημάτων αντίστοιχα.
+wind-speed & wind-angle: Καθορίζουν την ένταση και την κατεύθυνση του ανέμου.
+max-water: Η χωρητικότητα νερού κάθε πυροσβεστικού οχήματος.
+perception-radius: Η ακτίνα όρασης των αεροπλάνων και των οχημάτων.
+spread-interval & base-spread-prob: Ελέγχουν τον χρόνο και την πιθανότητα εξάπλωσης της φωτιάς.
+enable-pinecones: Διακόπτης που ενεργοποιεί/απενεργοποιεί το φαινόμενο δημιουργίας απομακρυσμένων εστιών από τα πεύκα.
+
+## THINGS TO NOTICE
+
+Παρατηρήστε πώς η κατεύθυνση του ανέμου διαμορφώνει το σχήμα του μετώπου της πυρκαγιάς. Η φωτιά τρέχει γρηγορότερα με τον άνεμο (downwind) και πιο αργά κόντρα σε αυτόν (upwind).
+Προσέξτε την ευφυή συμπεριφορά των πυροσβεστικών οχημάτων: αποφεύγουν να περνούν μέσα από δέντρα, διαχειρίζονται αποθέματα νερού και θυμούνται πού πήγαιναν αν χρειαστεί να σβήσουν μια μικρότερη εστία στη διαδρομή τους (detour behavior).
+Δείτε την αλλαγή χρώματος στα patches: Τα δέντρα σκοτεινιάζουν καθώς καίγονται, γίνονται κίτρινα αν σβηστούν εγκαίρως, ή μαύρα αν καούν ολοσχερώς.
+
+## THINGS TO TRY
+
+Ρυθμίστε το pine-ratio στο 1.0 (μόνο πεύκα) και ενεργοποιήστε τα pinecones. Η φωτιά θα πρέπει να εξαπλώνεται εκρηκτικά και σε μεγάλη απόσταση.
+Αλλάξτε την ισορροπία μεταξύ num-scouters και num-units. Είναι προτιμότερο να έχετε πολλά αεροπλάνα για γρήγορο εντοπισμό, ή πολλά οχήματα για γρήγορη κατάσβεση;
+Τρέξτε την προσομοίωση με δυνατό άνεμο και προσπαθήστε να σβήσετε τη φωτιά τοποθετώντας τα οχήματα στην πλευρά που φυσάει ο αέρας.
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+Χρήση της μεθόδου mouse-down? μέσα στη ignite-at-mouse που επιτρέπει στον χρήστη να αλληλεπιδράσει άμεσα με τον χάρτη σε πραγματικό χρόνο.
+Εκτεταμένη χρήση αναφοράς στόχων με το min-one-of για τον εντοπισμό της κοντινότερης εστίας πυρκαγιάς.
+Τριγωνομετρικές συναρτήσεις (sin, cos) κατά το setup για τη μετατροπή της γωνίας και της ταχύτητας του ανέμου σε διανύσματα X και Y.
+
+## RELATED MODELS
+
+Fire: Το κλασικό μοντέλο εξάπλωσης δασικής πυρκαγιάς της βιβλιοθήκης του NetLogo.
+Termites: Αξιοποιεί παρόμοια λογική περιπλάνησης και αναζήτησης/μεταφοράς στοιχείων (όπως η συμπεριφορά αναζήτησης και επαναφοράς των units).
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
